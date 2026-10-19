@@ -1,246 +1,355 @@
-import os
-import shutil
-import random
+import cv2
+import numpy as np
+import tensorflow as tf
+from collections import deque
+
+# ============================================================
+# ASL WEBCAM TEST - MobileNetV2
+# ============================================================
+
+MODEL_PATH = "sign_language_mobilenetv2.keras"
+
+IMG_SIZE = 160
+
+CAMERA_INDEX = 0
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+# Smoothing
+SMOOTHING_FRAMES = 8
+
+# Confidence rules
+MIN_CONFIDENCE = 0.50
+MIN_MARGIN = 0.12
+
+CLASS_NAMES = [
+    "A-samples", "B-samples", "C-samples", "D-samples",
+    "E-samples", "F-samples", "G-samples", "H-samples",
+    "I-samples", "K-samples", "L-samples", "M-samples",
+    "N-samples", "O-samples", "P-samples", "Q-samples",
+    "R-samples", "S-samples", "T-samples", "U-samples",
+    "V-samples", "W-samples", "X-samples", "Y-samples"
+]
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+print("\nLoading MobileNetV2 model...\n")
+
+model = tf.keras.models.load_model(MODEL_PATH)
+
+print("Model loaded successfully.")
+print(f"Loaded {len(CLASS_NAMES)} classes.")
+
+# ============================================================
+# PREPROCESSING
+# IMPORTANT:
+# - BGR -> RGB
+# - SQUARE crop
+# - 160x160
+# - MobileNetV2 preprocessing
+# ============================================================
+
+def preprocess_roi(roi):
+
+    rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+
+    rgb = cv2.resize(
+        rgb,
+        (IMG_SIZE, IMG_SIZE),
+        interpolation=cv2.INTER_AREA
+    )
+
+    image = rgb.astype(np.float32)
+
+    image = tf.keras.applications.mobilenet_v2.preprocess_input(
+        image
+    )
+
+    return np.expand_dims(image, axis=0)
 
 
 # ============================================================
-# CONFIGURATION
+# CAMERA
 # ============================================================
 
-SOURCE_DIR = "dataset"
-OUTPUT_DIR = "dataset_split"
+print("\nStarting webcam...")
+print("Press Q to quit.")
 
-TRAIN_DIR = os.path.join(
-    OUTPUT_DIR,
-    "train"
+cap = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_AVFOUNDATION
 )
 
-VAL_DIR = os.path.join(
-    OUTPUT_DIR,
-    "validation"
-)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
 
-TRAIN_RATIO = 0.8
+if not cap.isOpened():
+    print("\nERROR: Could not open webcam.")
+    raise SystemExit
 
-SEED = 42
-
-random.seed(SEED)
-
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
 # ============================================================
-# CREATE OUTPUT DIRECTORIES
+# PREDICTION HISTORY
 # ============================================================
 
-os.makedirs(
-    TRAIN_DIR,
-    exist_ok=True
+probability_history = deque(
+    maxlen=SMOOTHING_FRAMES
 )
-
-os.makedirs(
-    VAL_DIR,
-    exist_ok=True
-)
-
 
 # ============================================================
-# GET CLASSES
+# MAIN LOOP
 # ============================================================
 
-classes = sorted([
+while True:
 
-    folder
+    ret, frame = cap.read()
 
-    for folder in os.listdir(SOURCE_DIR)
+    if not ret:
+        print("Failed to read frame.")
+        break
 
-    if os.path.isdir(
-        os.path.join(
-            SOURCE_DIR,
-            folder
-        )
+    frame = cv2.flip(frame, 1)
+
+    h, w = frame.shape[:2]
+
+    # ========================================================
+    # SQUARE ROI
+    #
+    # This is IMPORTANT.
+    #
+    # The previous version used a rectangular ROI and then
+    # resized it to 160x160, which can distort the hand.
+    # MobileNetV2 now receives a square crop.
+    # ========================================================
+
+    box_size = int(min(w, h) * 0.82)
+
+    x1 = (w - box_size) // 2
+    y1 = (h - box_size) // 2
+
+    x2 = x1 + box_size
+    y2 = y1 + box_size
+
+    roi = frame[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        continue
+
+    # ========================================================
+    # PREDICT
+    # ========================================================
+
+    input_image = preprocess_roi(roi)
+
+    predictions = model.predict(
+        input_image,
+        verbose=0
+    )[0]
+
+    predictions = np.asarray(
+        predictions,
+        dtype=np.float32
     )
 
-])
+    # Softmax safety
+    if not np.isclose(predictions.sum(), 1.0):
+        predictions = tf.nn.softmax(predictions).numpy()
 
+    probability_history.append(predictions)
 
-print("\nClasses found:")
-print(classes)
-
-print(
-    "\nNumber of classes:",
-    len(classes)
-)
-
-
-# ============================================================
-# SPLIT EACH CLASS
-# ============================================================
-
-total_train = 0
-total_val = 0
-
-
-for class_name in classes:
-
-    source_class_dir = os.path.join(
-        SOURCE_DIR,
-        class_name
+    smoothed = np.mean(
+        np.stack(probability_history),
+        axis=0
     )
 
-    train_class_dir = os.path.join(
-        TRAIN_DIR,
-        class_name
-    )
+    top_indices = np.argsort(smoothed)[::-1]
 
-    val_class_dir = os.path.join(
-        VAL_DIR,
-        class_name
-    )
+    top1 = int(top_indices[0])
+    top2 = int(top_indices[1])
 
-    os.makedirs(
-        train_class_dir,
-        exist_ok=True
-    )
+    confidence = float(smoothed[top1])
+    second_confidence = float(smoothed[top2])
 
-    os.makedirs(
-        val_class_dir,
-        exist_ok=True
-    )
+    margin = confidence - second_confidence
 
+    # ========================================================
+    # DECISION
+    # ========================================================
 
-    # --------------------------------------------------------
-    # GET IMAGES
-    # --------------------------------------------------------
-
-    images = [
-
-        file
-
-        for file in os.listdir(
-            source_class_dir
-        )
-
-        if file.lower().endswith(
-            (
-                ".jpg",
-                ".jpeg",
-                ".png"
-            )
-        )
-
-    ]
-
-
-    # --------------------------------------------------------
-    # SHUFFLE
-    # --------------------------------------------------------
-
-    random.shuffle(
-        images
-    )
-
-
-    # --------------------------------------------------------
-    # CALCULATE SPLIT
-    # --------------------------------------------------------
-
-    split_index = int(
-        len(images) * TRAIN_RATIO
-    )
-
-    train_images = images[
-        :split_index
-    ]
-
-    val_images = images[
-        split_index:
-    ]
-
-
-    # --------------------------------------------------------
-    # COPY TRAINING IMAGES
-    # --------------------------------------------------------
-
-    for image in train_images:
-
-        source = os.path.join(
-            source_class_dir,
-            image
+    if (
+        confidence >= MIN_CONFIDENCE
+        and margin >= MIN_MARGIN
+    ):
+        prediction_text = CLASS_NAMES[top1].replace(
+            "-samples", ""
         )
 
-        destination = os.path.join(
-            train_class_dir,
-            image
-        )
+        status_text = "Stable prediction"
+        status_color = (0, 220, 0)
 
-        shutil.copy2(
-            source,
-            destination
-        )
+    else:
+        prediction_text = "No confident prediction"
+        status_text = "Move hand / improve lighting"
+        status_color = (0, 165, 255)
 
+    # ========================================================
+    # DRAW ROI
+    # ========================================================
 
-    # --------------------------------------------------------
-    # COPY VALIDATION IMAGES
-    # --------------------------------------------------------
-
-    for image in val_images:
-
-        source = os.path.join(
-            source_class_dir,
-            image
-        )
-
-        destination = os.path.join(
-            val_class_dir,
-            image
-        )
-
-        shutil.copy2(
-            source,
-            destination
-        )
-
-
-    total_train += len(
-        train_images
+    cv2.rectangle(
+        frame,
+        (x1, y1),
+        (x2, y2),
+        (255, 255, 255),
+        3
     )
 
-    total_val += len(
-        val_images
+    # ========================================================
+    # TOP 3
+    # ========================================================
+
+    top3 = []
+
+    for rank in range(3):
+
+        idx = int(top_indices[rank])
+
+        name = CLASS_NAMES[idx].replace(
+            "-samples", ""
+        )
+
+        percentage = float(
+            smoothed[idx] * 100
+        )
+
+        top3.append(
+            f"{name}: {percentage:.1f}%"
+        )
+
+    # ========================================================
+    # HEADER
+    # ========================================================
+
+    overlay = frame.copy()
+
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (w, 120),
+        (0, 0, 0),
+        -1
     )
 
-
-    print(
-        f"{class_name:12s} "
-        f"Train: {len(train_images):3d} "
-        f"Validation: {len(val_images):3d}"
+    frame = cv2.addWeighted(
+        overlay,
+        0.78,
+        frame,
+        0.22,
+        0
     )
 
+    cv2.putText(
+        frame,
+        f"Prediction: {prediction_text}",
+        (25, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
 
-# ============================================================
-# SUMMARY
-# ============================================================
+    cv2.putText(
+        frame,
+        f"Confidence: {confidence * 100:.1f}%",
+        (25, 82),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        status_color,
+        2,
+        cv2.LINE_AA
+    )
 
-print("\n")
-print("=" * 60)
-print("DATASET SPLIT COMPLETE")
-print("=" * 60)
+    cv2.putText(
+        frame,
+        status_text,
+        (25, 108),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        status_color,
+        2,
+        cv2.LINE_AA
+    )
 
-print(
-    "\nTotal training images:",
-    total_train
-)
+    # ========================================================
+    # TOP 3 PANEL
+    # ========================================================
 
-print(
-    "Total validation images:",
-    total_val
-)
+    panel_x = 25
+    panel_y = h - 115
 
-print(
-    "Total images:",
-    total_train + total_val
-)
+    cv2.rectangle(
+        frame,
+        (panel_x - 10, panel_y - 28),
+        (330, h - 15),
+        (0, 0, 0),
+        -1
+    )
 
-print(
-    "\nDataset created at:",
-    OUTPUT_DIR
-)
+    cv2.putText(
+        frame,
+        "Top predictions:",
+        (panel_x, panel_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+    for i, text in enumerate(top3):
+
+        cv2.putText(
+            frame,
+            text,
+            (panel_x, panel_y + 28 + i * 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA
+        )
+
+    # ========================================================
+    # INSTRUCTIONS
+    # ========================================================
+
+    cv2.putText(
+        frame,
+        "Place one hand inside the SQUARE | Q = quit",
+        (25, h - 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+    cv2.imshow(
+        "ASL Sign Language Recognition",
+        frame
+    )
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q") or key == ord("Q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+print("\nWebcam closed.")
